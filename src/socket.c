@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #include "silly.h"
 #include "platform.h"
@@ -176,6 +177,7 @@ struct socket {
 	fd_t fd;
 	uint32_t version;
 	uint8_t type;
+	uint8_t dirty;
 	atomic_uint_least8_t state;
 	atomic_uint_least32_t wlbytes;
 	uint32_t wloffset;
@@ -192,6 +194,51 @@ struct socket_pool {
 	struct socket *free_head;
 	struct socket **free_tail;
 };
+
+#define WLIST_CACHE_SIZE 128
+
+struct wlist_cache {
+	struct wlist nodes[WLIST_CACHE_SIZE];
+	struct wlist *free_head;
+};
+
+static inline int wcache_is_pooled(struct wlist_cache *wc, struct wlist *w)
+{
+	return (uintptr_t)w >= (uintptr_t)&wc->nodes[0] &&
+	       (uintptr_t)w < (uintptr_t)&wc->nodes[WLIST_CACHE_SIZE];
+}
+
+static void wcache_init(struct wlist_cache *wc)
+{
+	int i;
+	wc->free_head = &wc->nodes[0];
+	for (i = 0; i < WLIST_CACHE_SIZE - 1; i++)
+		wc->nodes[i].next = &wc->nodes[i + 1];
+	wc->nodes[WLIST_CACHE_SIZE - 1].next = NULL;
+}
+
+static inline struct wlist *wcache_get(struct wlist_cache *wc)
+{
+	struct wlist *w;
+	if (wc->free_head != NULL) {
+		w = wc->free_head;
+		wc->free_head = w->next;
+		return w;
+	}
+	return (struct wlist *)mem_alloc(sizeof(struct wlist));
+}
+
+static inline void wcache_put(struct wlist_cache *wc, struct wlist *w)
+{
+	if (wcache_is_pooled(wc, w)) {
+		w->next = wc->free_head;
+		wc->free_head = w;
+	} else {
+		mem_free(w);
+	}
+}
+
+#define DIRTY_CAPACITY 128
 
 struct socket_manager {
 	fd_t spfd;
@@ -212,6 +259,11 @@ struct socket_manager {
 	silly_socket_id_t reserveid;
 	//netstat
 	struct silly_netstat netstat;
+	//wlist node cache
+	struct wlist_cache wcache;
+	//dirty socket tracking for batched writev
+	int dirty_count;
+	struct socket *dirty_sockets[DIRTY_CAPACITY];
 	//temp buffer
 	uint8_t readbuf[TCP_READ_BUF_SIZE];
 };
@@ -326,11 +378,12 @@ struct message_close {
 
 static struct socket_manager *SM;
 
-static inline void wlist_append(struct socket *s, uint8_t *buf, size_t size,
+static inline void wlist_append(struct socket_manager *ss, struct socket *s,
+				uint8_t *buf, size_t size,
 				void (*freex)(void *))
 {
 	struct wlist *w;
-	w = (struct wlist *)mem_alloc(sizeof(*w));
+	w = wcache_get(&ss->wcache);
 	w->size = size;
 	w->buf = buf;
 	w->free = freex;
@@ -364,7 +417,7 @@ static inline void wlist_appendudp(struct socket *s, uint8_t *buf, size_t size,
 	return;
 }
 
-static void wlist_free(struct socket *s)
+static void wlist_free(struct socket_manager *ss, struct socket *s)
 {
 	struct wlist *w;
 	struct wlist *t;
@@ -374,7 +427,7 @@ static void wlist_free(struct socket *s)
 		w = w->next;
 		assert(t->buf);
 		t->free(t->buf);
-		mem_free(t);
+		wcache_put(&ss->wcache, t);
 	}
 	s->wlhead = NULL;
 	s->wltail = &s->wlhead;
@@ -391,6 +444,7 @@ static void socket_default(struct socket *s)
 {
 	s->fd = -1;
 	s->type = SOCKET_RESERVE;
+	s->dirty = 0;
 	s->wloffset = 0;
 	atomic_store_explicit(&s->state, 0, memory_order_relaxed);
 	s->wlhead = NULL;
@@ -697,7 +751,7 @@ static inline void remove_from_sp(struct socket_manager *ss, struct socket *s)
 static inline void free_socket(struct socket_manager *ss, struct socket *s)
 {
 	assert(s->type != SOCKET_RESERVE);
-	wlist_free(s);
+	wlist_free(ss, s);
 	remove_from_sp(ss, s);
 	pool_free(&ss->pool, s);
 }
@@ -711,7 +765,7 @@ static inline void zombine_socket(struct socket *s)
 		free_socket(SM, s);
 		return;
 	}
-	wlist_free(s);
+	wlist_free(SM, s);
 	remove_from_sp(SM, s);
 	set_zombine(s);
 }
@@ -844,12 +898,11 @@ err:
 	return -1;
 }
 
-static ssize_t sendn(fd_t fd, const uint8_t *buf, size_t sz)
+static ssize_t sendv(fd_t fd, struct iovec *iov, int iovcnt)
 {
 	for (;;) {
 		ssize_t len;
-		len = send(fd, (void *)buf, sz, 0);
-		assert(len != 0);
+		len = writev(fd, iov, iovcnt);
 		if (len == -1) {
 			switch (errno) {
 			case EINTR:
@@ -860,6 +913,7 @@ static ssize_t sendn(fd_t fd, const uint8_t *buf, size_t sz)
 				return -1;
 			}
 		}
+		assert(len != 0);
 		return len;
 	}
 	assert(!"never come here");
@@ -1021,38 +1075,96 @@ int socket_send_size(silly_socket_id_t sid)
 	return atomic_load_explicit(&s->wlbytes, memory_order_relaxed);
 }
 
-static int send_msg_tcp(struct socket_manager *ss, struct socket *s)
+static int drain_wlist_tcp(struct socket_manager *ss, struct socket *s)
 {
-	struct wlist *w = s->wlhead;
-	while (w) {
-		ssize_t sz;
-		assert(w->size > s->wloffset);
-		sz = sendn(s->fd, w->buf + s->wloffset, w->size - s->wloffset);
-		if (unlikely(sz < 0)) {
-			return -1;
-		}
-		s->wloffset += sz;
-		atomic_fetch_sub_explicit(&s->wlbytes, sz,
-					  memory_order_relaxed);
-		if (s->wloffset < w->size) //send some
-			break;
-		assert((size_t)s->wloffset == w->size);
-		s->wloffset = 0;
-		s->wlhead = w->next;
-		w->free(w->buf);
-		mem_free(w);
+	struct iovec iov[64];
+	struct wlist *w;
+	int iovcnt;
+	ssize_t total;
+	for (;;) {
 		w = s->wlhead;
-		if (w == NULL) { //send ok
-			s->wltail = &s->wlhead;
-			write_enable(ss, s, 0);
-			if (is_closewait(s)) {
-				atomic_sub(&ss->netstat.tcp_connections, 1);
-				free_socket(ss, s);
-				return 0;
+		if (w == NULL)
+			break;
+		iovcnt = 0;
+		for (; w != NULL && iovcnt < (int)ARRAY_SIZE(iov); w = w->next) {
+			uint8_t *base = w->buf;
+			size_t len = w->size;
+			if (iovcnt == 0) {
+				base += s->wloffset;
+				len -= s->wloffset;
 			}
+			iov[iovcnt].iov_base = base;
+			iov[iovcnt].iov_len = len;
+			iovcnt++;
+		}
+		total = sendv(s->fd, iov, iovcnt);
+		if (unlikely(total < 0))
+			return -1;
+		if (total == 0) { //EAGAIN
+			write_enable(ss, s, 1);
+			return 0;
+		}
+		atomic_fetch_sub_explicit(&s->wlbytes, total,
+					  memory_order_relaxed);
+		//consume sent bytes from wlist
+		w = s->wlhead;
+		while (w && total > 0) {
+			size_t avail = w->size - s->wloffset;
+			if ((size_t)total < avail) {
+				s->wloffset += total;
+				total = 0;
+				break;
+			}
+			total -= avail;
+			s->wloffset = 0;
+			s->wlhead = w->next;
+			w->free(w->buf);
+			wcache_put(&ss->wcache, w);
+			w = s->wlhead;
 		}
 	}
+	//all data sent
+	s->wltail = &s->wlhead;
+	write_enable(ss, s, 0);
+	if (is_closewait(s)) {
+		atomic_sub(&ss->netstat.tcp_connections, 1);
+		free_socket(ss, s);
+	}
 	return 0;
+}
+
+
+static void flush_dirty(struct socket_manager *ss);
+
+static void mark_dirty(struct socket_manager *ss, struct socket *s)
+{
+	if (s->dirty)
+		return;
+	s->dirty = 1;
+	ss->dirty_sockets[ss->dirty_count++] = s;
+	if (ss->dirty_count >= DIRTY_CAPACITY)
+		flush_dirty(ss);
+}
+
+static void flush_dirty(struct socket_manager *ss)
+{
+	int i;
+	int count = ss->dirty_count;
+	ss->dirty_count = 0;
+	for (i = 0; i < count; i++) {
+		struct socket *s = ss->dirty_sockets[i];
+		s->dirty = 0;
+		if (is_zombine(s) || sid(s) < 0)
+			continue;
+		if (wlist_empty(s))
+			continue;
+		if (s->type != SOCKET_TCP_CONNECTION)
+			continue;
+		if (drain_wlist_tcp(ss, s) < 0) {
+			report_close(ss, s, errno);
+			zombine_socket(s);
+		}
+	}
 }
 
 static int send_msg_udp(struct socket_manager *ss, struct socket *s)
@@ -1511,27 +1623,9 @@ static void op_tcp_send(struct socket_manager *ss, struct op_tcpsend *op,
 	}
 	atomic_add(&ss->netstat.sent_bytes, sz);
 	atomic_add(&s->sent_bytes, sz);
-	if (wlist_empty(s) && !is_connecting(s)) { //try send
-		ssize_t n = sendn(s->fd, data, sz);
-		if (n < 0) {
-			freex(data);
-			atomic_sub(&s->wlbytes, sz);
-			report_close(ss, s, errno);
-			zombine_socket(s);
-		} else if ((size_t)n < sz) {
-			s->wloffset = n;
-			wlist_append(s, data, sz, freex);
-			write_enable(ss, s, 1);
-			atomic_sub(&s->wlbytes, n);
-		} else {
-			assert((size_t)n == sz);
-			freex(data);
-			atomic_sub(&s->wlbytes, sz);
-		}
-	} else {
-		assert(test_state(s, STATE_WRITING | STATE_READING));
-		wlist_append(s, data, sz, freex);
-	}
+	wlist_append(ss, s, data, sz, freex);
+	if (!is_connecting(s))
+		mark_dirty(ss, s);
 }
 
 int socket_udp_send(silly_socket_id_t sid, uint8_t *buf, size_t sz,
@@ -1675,6 +1769,7 @@ static int op_process(struct socket_manager *ss)
 			break;
 		}
 	}
+	flush_dirty(ss);
 	return 0;
 }
 
@@ -1751,7 +1846,7 @@ int socket_poll()
 						 &has_data_to_read);
 			}
 			if (SP_WRITE(e)) {
-				if (send_msg_tcp(ss, s) < 0) {
+				if (drain_wlist_tcp(ss, s) < 0) {
 					err = errno;
 				}
 			}
@@ -1812,6 +1907,7 @@ int socket_init()
 	ss = mem_alloc(sizeof(*ss));
 	memset(ss, 0, sizeof(*ss));
 	pool_init(&ss->pool);
+	wcache_init(&ss->wcache);
 	flipbuf_init(&ss->opbuf);
 	err = trigger_init(&ss->ctrl);
 	if (unlikely(err < 0))
@@ -1851,6 +1947,7 @@ void socket_exit()
 {
 	int i;
 	assert(SM);
+	flush_dirty(SM);
 	sp_free(SM->spfd);
 	closesocket(SM->reservefd);
 	trigger_destroy(&SM->ctrl);
